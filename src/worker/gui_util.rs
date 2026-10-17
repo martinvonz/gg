@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use futures_util::TryStreamExt;
 use itertools::Itertools;
 use jj_frontend::{
-    revset_util::{self, default_ignored_remote_name},
+    revset_util::UserRevsetEvaluationError,
     runner::{
         RunnerError, RunnerEvent, RunnerEvents, RunnerOptions, SnapshotConfig,
         SnapshotConfigDiagnostics, WorkspaceOperationRunner,
@@ -36,14 +36,12 @@ use jj_lib::{
     repo::{ReadonlyRepo, Repo},
     repo_path::RepoPath,
     revset::{
-        self, Revset, RevsetAliasesMap, RevsetDiagnostics, RevsetEvaluationError, RevsetExpression,
-        RevsetExtensions, RevsetParseContext, RevsetResolutionError, RevsetStreamExt,
-        RevsetWorkspaceContext, SymbolResolverExtension, UserRevsetExpression,
+        Revset, RevsetAliasesMap, RevsetDiagnostics, RevsetEvaluationError, RevsetExpression,
+        RevsetExtensions, RevsetResolutionError, RevsetStreamExt, UserRevsetExpression,
     },
     rewrite,
     settings::UserSettings,
     transaction::Transaction,
-    ui_path::RepoPathUiConverter,
     view::View,
     workspace::{DefaultWorkspaceLoaderFactory, Workspace, WorkspaceLoaderFactory},
 };
@@ -79,11 +77,7 @@ pub struct WorkspaceSession<'a> {
 }
 
 pub(crate) struct WorkspaceData {
-    pub path_converter: RepoPathUiConverter,
-    extensions: RevsetExtensions,
     pub workspace_settings: UserSettings,
-    pub aliases_map: RevsetAliasesMap,
-    pub fileset_aliases_map: FilesetAliasesMap,
     pub query_choices: HashMap<String, String>,
 }
 
@@ -104,6 +98,15 @@ pub(crate) enum RevsetError {
     Evaluation(#[from] RevsetEvaluationError),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl From<UserRevsetEvaluationError> for RevsetError {
+    fn from(value: UserRevsetEvaluationError) -> Self {
+        match value {
+            UserRevsetEvaluationError::Resolution(err) => RevsetError::Resolution(err),
+            UserRevsetEvaluationError::Evaluation(err) => RevsetError::Evaluation(err),
+        }
+    }
 }
 
 impl From<BackendError> for RevsetError {
@@ -129,21 +132,12 @@ impl WorkerSession {
             &default_backend_factories::default_working_copy_factories(),
         )?;
 
-        let path_converter = RepoPathUiConverter::Fs {
-            cwd: workspace.workspace_root().to_owned(),
-            base: workspace.workspace_root().to_owned(),
-        };
-
         let data: WorkspaceData = WorkspaceData {
             workspace_settings: settings,
-            path_converter,
-            aliases_map,
-            fileset_aliases_map,
-            extensions: Default::default(),
             query_choices: preset_choices,
         };
 
-        let env = new_workspace_environment(&workspace, &data)?;
+        let env = new_workspace_environment(&workspace, aliases_map, fileset_aliases_map)?;
         let snapshot_config = load_snapshot_config(&workspace, &env)?;
         let runner = WorkspaceOperationRunner::load_at_head(
             &LogRunnerEvents,
@@ -152,7 +146,8 @@ impl WorkerSession {
             runner_options(),
         )
         .await?;
-        let operation = OperationData::new(runner.workspace_name(), &data, runner.repo().clone());
+        let operation =
+            OperationData::new(runner.workspace_name(), runner.env(), runner.repo().clone());
         let workspace = runner.workspace();
 
         let index_store = workspace.repo_loader().index_store();
@@ -189,15 +184,21 @@ impl WorkspaceSession<'_> {
         self.runner.workspace()
     }
 
+    pub(crate) fn env(&self) -> &WorkspaceEnvironment {
+        self.runner.env()
+    }
+
     /// Re-reads the configuration after it has been changed. The workspace is reloaded so that it
     /// uses the new settings.
     pub(crate) fn reload_config(&mut self) -> Result<()> {
         let workspace_root = self.runner.workspace_root().to_owned();
         let loader = DefaultWorkspaceLoaderFactory.create(&workspace_root)?;
+        let aliases_map;
+        let fileset_aliases_map;
         (
             self.data.workspace_settings,
-            self.data.aliases_map,
-            self.data.fileset_aliases_map,
+            aliases_map,
+            fileset_aliases_map,
             self.data.query_choices,
         ) = read_config(Some(&WorkspaceLocation {
             workspace_root,
@@ -208,7 +209,7 @@ impl WorkspaceSession<'_> {
             &default_backend_factories::default_backend_factories(),
             &default_backend_factories::default_working_copy_factories(),
         )?;
-        let env = new_workspace_environment(&workspace, &self.data)?;
+        let env = new_workspace_environment(&workspace, aliases_map, fileset_aliases_map)?;
         self.snapshot_config = load_snapshot_config(&workspace, &env)?;
         let repo = self.runner.repo().clone();
         self.runner = WorkspaceOperationRunner::load_at(
@@ -219,7 +220,8 @@ impl WorkspaceSession<'_> {
             runner_options(),
             true,
         )?;
-        self.operation = OperationData::new(self.name(), &self.data, self.runner.repo().clone());
+        self.operation =
+            OperationData::new(self.name(), self.runner.env(), self.runner.repo().clone());
         Ok(())
     }
 
@@ -229,7 +231,8 @@ impl WorkspaceSession<'_> {
         if self.runner.repo().op_id() == self.operation.repo.op_id() {
             return false;
         }
-        self.operation = OperationData::new(self.name(), &self.data, self.runner.repo().clone());
+        self.operation =
+            OperationData::new(self.name(), self.runner.env(), self.runner.repo().clone());
         true
     }
 
@@ -449,8 +452,10 @@ impl WorkspaceSession<'_> {
         repo: &'op dyn Repo,
         revset_expr: Arc<UserRevsetExpression>,
     ) -> Result<Box<dyn Revset + 'op>, RevsetError> {
-        let resolved_expression = revset_expr.resolve_user_expression(repo, &self.resolver())?;
-        let revset = resolved_expression.evaluate()?;
+        let revset = self
+            .env()
+            .revset_evaluator(repo, &self.operation.prefix_context, revset_expr)
+            .evaluate()?;
         Ok(revset)
     }
 
@@ -458,7 +463,10 @@ impl WorkspaceSession<'_> {
         &'op self,
         revset_str: &str,
     ) -> Result<Box<dyn Revset + 'op>, RevsetError> {
-        let revset_expr = parse_revset(&self.parse_context(), revset_str)?;
+        let revset_expr = self
+            .env()
+            .parse_revset(&mut RevsetDiagnostics::new(), revset_str)
+            .context("parse revset")?;
         self.evaluate_revset_expr(self.operation.repo.as_ref(), revset_expr)
     }
 
@@ -486,12 +494,9 @@ impl WorkspaceSession<'_> {
     }
 
     pub(crate) fn evaluate_immutable(&self) -> Result<Box<dyn Revset + '_>> {
-        let mut diagnostics = RevsetDiagnostics::new(); // XXX pass this down, then include it in the Result
-        let expr =
-            revset_util::parse_immutable_heads_expression(&mut diagnostics, &self.parse_context())?;
-        let expr = expr.ancestors();
-        let revset = self.evaluate_revset_expr(self.operation.repo.as_ref(), expr)?;
-        Ok(revset)
+        let repo = self.operation.repo.as_ref();
+        let expr = self.env().resolve_immutable_expression(repo, false)?;
+        Ok(expr.evaluate(repo)?)
     }
 
     fn resolve_optional<'op, 'set: 'op, T: AsRef<dyn Revset + 'set>>(
@@ -697,25 +702,12 @@ impl WorkspaceSession<'_> {
      * Functions for creating temporary per-request derived data *
      *************************************************************/
 
-    fn parse_context(&self) -> RevsetParseContext<'_> {
-        self.data
-            .parse_context(self.workspace().workspace_name(), self.repo().store())
-    }
-
     // the prefix context caches this itself, but the way it does so is not convenient for us - you need a fallible method and the &dyn Repo
     fn prefix_index(&self) -> IdPrefixIndex<'_> {
         self.operation
             .prefix_context
             .populate(self.repo())
             .expect("prefix context disambiguate_within()")
-    }
-
-    fn resolver(&self) -> revset::SymbolResolver<'_> {
-        revset::SymbolResolver::new(
-            self.operation.repo.as_ref(),
-            &([] as [Box<dyn SymbolResolverExtension>; 0]),
-        )
-        .with_id_prefix_context(&self.operation.prefix_context)
     }
 
     fn ref_index(&self) -> &Rc<RefIndex> {
@@ -750,8 +742,10 @@ impl WorkspaceSession<'_> {
             None => vec![],
         };
 
-        let default_revset =
-            config::read_log_revset(&self.data.workspace_settings, &self.data.aliases_map);
+        let default_revset = config::read_log_revset(
+            &self.data.workspace_settings,
+            self.env().revset_aliases_map(),
+        );
 
         let mut query_choices = HashMap::new();
         query_choices.insert("default".to_string(), default_revset.clone());
@@ -926,14 +920,10 @@ impl WorkspaceSession<'_> {
         ids: impl IntoIterator<Item = CommitId>,
     ) -> Result<bool> {
         let check_revset = RevsetExpression::commits(ids.into_iter().collect());
-
-        let mut diagnostics = RevsetDiagnostics::new();
-        let immutable_heads =
-            revset_util::parse_immutable_heads_expression(&mut diagnostics, &self.parse_context())?;
-        let immutable_revset = immutable_heads.ancestors();
-        let intersection_revset = check_revset.intersection(&immutable_revset);
-
-        let immutable_revs = self.evaluate_revset_expr(repo, intersection_revset)?;
+        let immutable_revset = self.env().resolve_immutable_expression(repo, false)?;
+        let immutable_revs = check_revset
+            .intersection(&immutable_revset)
+            .evaluate(repo)?;
         Ok(!immutable_revs.is_empty()?)
     }
 
@@ -1049,62 +1039,18 @@ impl WorkspaceSession<'_> {
     }
 }
 
-impl WorkspaceData {
-    // unfortunately not cached as it borrows from everything
-    fn parse_context<'a>(
-        &'a self,
-        name: &'a WorkspaceName,
-        store: &'a jj_lib::store::Store,
-    ) -> RevsetParseContext<'a> {
-        let workspace_context = RevsetWorkspaceContext {
-            path_converter: &self.path_converter,
-            workspace_name: name,
-        };
-        let now = if let Some(timestamp) = self.workspace_settings.commit_timestamp() {
-            jiff::Timestamp::from_millisecond(timestamp.timestamp.0)
-                .unwrap()
-                .to_zoned(jiff::tz::TimeZone::system())
-        } else {
-            jiff::Zoned::now()
-        };
-        RevsetParseContext {
-            aliases_map: &self.aliases_map,
-            local_variables: HashMap::new(),
-            user_email: self.workspace_settings.user_email(),
-            current_time: now,
-            default_ignored_remote: default_ignored_remote_name(store),
-            fileset_aliases_map: &self.fileset_aliases_map,
-            extensions: &self.extensions,
-            workspace: Some(workspace_context),
-        }
-    }
-}
-
 impl OperationData {
-    pub fn new(id: &WorkspaceName, data: &WorkspaceData, repo: Arc<ReadonlyRepo>) -> OperationData {
+    pub fn new(
+        id: &WorkspaceName,
+        env: &WorkspaceEnvironment,
+        repo: Arc<ReadonlyRepo>,
+    ) -> OperationData {
         let wc_id = repo
             .view()
             .get_wc_commit_id(id)
             .expect("No working copy found for workspace")
             .clone();
-
-        let revset_string: String = data
-            .workspace_settings
-            .get_string("revsets.short-prefixes")
-            .unwrap_or_else(|_| {
-                data.workspace_settings
-                    .get_string("revsets.log")
-                    .unwrap_or_default()
-            });
-
-        // guarantee that an index can be populated - we will unwrap later
-        let prefix_context =
-            IdPrefixContext::default().disambiguate_within(if !revset_string.is_empty() {
-                parse_revset(&data.parse_context(id, repo.store()), &revset_string)
-                    .expect("init prefix context: parse revsets.short-prefixes")
-            } else {
-                RevsetExpression::all()
-            });
+        let prefix_context = env.new_id_prefix_context();
 
         OperationData {
             repo,
@@ -1142,17 +1088,6 @@ fn hosts_repo(workspace_root: &Path, repo_path: &Path) -> bool {
         .ok()
         .and_then(|loader| dunce::canonicalize(loader.repo_path()).ok())
         .is_some_and(|loaded_path| loaded_path == repo_path)
-}
-
-fn parse_revset(
-    parse_context: &RevsetParseContext,
-    revision: &str,
-) -> Result<Arc<UserRevsetExpression>, RevsetError> {
-    let mut diagnostics = RevsetDiagnostics::new(); // XXX move this up and include it in errors
-    let expression =
-        revset::parse(&mut diagnostics, revision, parse_context).context("parse revset")?;
-    let expression = revset::optimize(expression);
-    Ok(expression)
 }
 
 /*************************/
@@ -1278,7 +1213,8 @@ fn runner_options() -> RunnerOptions {
 
 fn new_workspace_environment(
     workspace: &Workspace,
-    data: &WorkspaceData,
+    aliases_map: RevsetAliasesMap,
+    fileset_aliases_map: FilesetAliasesMap,
 ) -> Result<Arc<WorkspaceEnvironment>> {
     let mut diagnostics = WorkspaceEnvironmentDiagnostics::new();
     let env = WorkspaceEnvironment::new(
@@ -1286,8 +1222,8 @@ fn new_workspace_environment(
         workspace,
         workspace.workspace_root(),
         Arc::new(RevsetExtensions::default()),
-        data.fileset_aliases_map.clone(),
-        data.aliases_map.clone(),
+        fileset_aliases_map,
+        aliases_map,
     )?;
     log::debug!("{diagnostics:?}");
     Ok(Arc::new(env))

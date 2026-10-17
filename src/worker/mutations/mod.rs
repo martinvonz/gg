@@ -159,7 +159,7 @@ impl Mutation for ExternalResolve {
         let merge_editor = MergeEditor::from_settings(
             &ui,
             &ws.data.workspace_settings,
-            ws.data.path_converter.clone(),
+            ws.env().path_converter().clone(),
             ConflictMarkerStyle::Git,
         )
         .context("failed to load merge editor config")?;
