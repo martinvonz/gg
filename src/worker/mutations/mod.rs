@@ -6,16 +6,15 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::Arc;
 
-use anyhow::{Context, Error, Result};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{AsyncReadExt, TryStreamExt};
 use itertools::Itertools;
 use jj_cli::{
-    git_util::load_git_import_options,
     merge_tools::{self, ConflictResolveError, ExternalMergeTool, MergeEditor},
-    revset_util,
     ui::Ui,
 };
+use jj_frontend::{config_util, git_util::load_git_import_options};
 use jj_lib::{
     backend::{CommitId, TreeValue},
     conflicts::{self, ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue},
@@ -236,8 +235,7 @@ impl Mutation for GitFetch {
         let progress_sender = ws.sink();
         let git_settings = GitSettings::from_settings(&ws.data.workspace_settings)?;
         let remote_settings = ws.data.workspace_settings.remote_settings()?;
-        let import_options = load_git_import_options(&Ui::null(), &git_settings, &remote_settings)
-            .map_err(|e| Error::new(e.error))?;
+        let import_options = load_git_import_options(&mut vec![], &git_settings, &remote_settings)?;
 
         for (remote_name, pattern) in &remote_patterns {
             let (bookmark_expr, tag_expr) = match pattern {
@@ -247,12 +245,11 @@ impl Mutation for GitFetch {
                 ),
                 None => (
                     StringExpression::all(),
-                    revset_util::parse_remote_fetch_tags(
-                        &Ui::null(),
+                    config_util::parse_remote_fetch_tags(
+                        &mut vec![],
                         &remote_settings,
                         RemoteName::new(remote_name),
-                    )
-                    .map_err(|e| Error::new(e.error))?
+                    )?
                     .unwrap_or_else(StringExpression::all),
                 ),
             };

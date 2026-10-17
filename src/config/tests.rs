@@ -188,24 +188,28 @@ fn recent_workspaces_returns_configured_paths() {
 }
 
 #[test]
-fn resolve_repo_path_finds_repo_from_subdir() {
+fn resolve_workspace_finds_repo_from_subdir() {
     let dir = tempfile::tempdir().unwrap();
     let repo_path = dir.path().join(".jj").join("repo");
     std::fs::create_dir_all(&repo_path).unwrap();
     let subdir = dir.path().join("nested").join("deeper");
     std::fs::create_dir_all(&subdir).unwrap();
 
-    let resolved = resolve_repo_path(Some(&subdir)).expect("repo path should resolve");
+    let resolved = resolve_workspace(Some(&subdir)).expect("workspace should resolve");
     assert_eq!(
-        dunce::canonicalize(resolved).unwrap(),
+        dunce::canonicalize(resolved.repo_path).unwrap(),
         dunce::canonicalize(repo_path).unwrap()
+    );
+    assert_eq!(
+        dunce::canonicalize(resolved.workspace_root).unwrap(),
+        dunce::canonicalize(dir.path()).unwrap()
     );
 }
 
 #[test]
-fn resolve_repo_path_is_none_outside_workspace() {
+fn resolve_workspace_is_none_outside_workspace() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(resolve_repo_path(Some(dir.path())).is_none());
+    assert!(resolve_workspace(Some(dir.path())).is_none());
 }
 
 /// Resolve the log revset with jj's real defaults, so builtin_log() is defined.

@@ -17,9 +17,9 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use jj_cli::config::default_config_layers;
 use jj_frontend::config_env::{ConfigEnv, config_from_environment};
+use jj_frontend::config_util::{self, ConfigWarning};
 use jj_lib::{
-    config::{ConfigGetError, ConfigLayer, ConfigNamePathBuf, ConfigSource, StackedConfig},
-    dsl_util::{AliasDeclarationParser, AliasesMap},
+    config::{ConfigLayer, ConfigNamePathBuf, ConfigSource, StackedConfig},
     fileset::FilesetAliasesMap,
     revset::RevsetAliasesMap,
     settings::UserSettings,
@@ -140,8 +140,16 @@ fn native_keys() -> HashSet<String> {
     keys
 }
 
-/// Find the repo inside a workspace (for callers that need config before a workspace has been loaded).
-pub fn resolve_repo_path(dir: Option<&Path>) -> Option<PathBuf> {
+/// Locations of a workspace and the repo it uses.
+#[derive(Clone, Debug)]
+pub struct WorkspaceLocation {
+    pub workspace_root: PathBuf,
+    pub repo_path: PathBuf,
+}
+
+/// Find the workspace containing `dir` (for callers that need config before a workspace has been
+/// loaded).
+pub fn resolve_workspace(dir: Option<&Path>) -> Option<WorkspaceLocation> {
     let cwd = match dir {
         Some(dir) => dir.to_owned(),
         None => std::env::var_os("OWD") // set by AppImage
@@ -154,18 +162,21 @@ pub fn resolve_repo_path(dir: Option<&Path>) -> Option<PathBuf> {
     DefaultWorkspaceLoaderFactory
         .create(workspace_root)
         .ok()
-        .map(|loader| loader.repo_path().to_owned())
+        .map(|loader| WorkspaceLocation {
+            workspace_root: loader.workspace_root().to_owned(),
+            repo_path: loader.repo_path().to_owned(),
+        })
 }
 
 /// Load the merged jj + GG configuration.
 ///
-/// Layers (low → high priority): jj defaults, bundled `gg.toml` defaults,
-/// user config, and (when `repo_path` is `Some`) repo-level config. Any
-/// non-native `gg.*` keys are extracted as jj overrides (see module docs).
+/// Layers (low → high priority): jj defaults, bundled `gg.toml` defaults, system config, user
+/// config, and (when `workspace` is `Some`) repo- and workspace-level config. Any non-native
+/// `gg.*` keys are extracted as jj overrides (see module docs).
 ///
-/// Returns `(settings, revset_aliases, preset_query_choices)`.
+/// Returns `(settings, revset_aliases, fileset_aliases, preset_query_choices)`.
 pub fn read_config(
-    repo_path: Option<&Path>,
+    workspace: Option<&WorkspaceLocation>,
 ) -> Result<(
     UserSettings,
     RevsetAliasesMap,
@@ -181,12 +192,17 @@ pub fn read_config(
     layers.push(gg_layer);
 
     let mut raw_config = config_from_environment(layers);
+    config_env.reload_system_config(&mut raw_config)?;
     config_env.reload_user_config(&mut raw_config)?;
-    if let Some(repo_path) = repo_path {
-        config_env.reset_repo_path(repo_path);
-        config_env
-            .reload_repo_config(&mut vec![], &mut raw_config)
-            .map_err(|e| anyhow!("{e:?}"))?;
+    if let Some(workspace) = workspace {
+        let mut warnings = vec![];
+        config_env.reset_workspace_and_reload_config(
+            &mut warnings,
+            &mut raw_config,
+            &workspace.repo_path,
+            &workspace.workspace_root,
+        )?;
+        log_config_warnings(&warnings);
     }
 
     let mut config = config_env.resolve_config(&raw_config)?;
@@ -314,64 +330,34 @@ fn read_preset_choices(stacked_config: &StackedConfig) -> HashMap<String, String
 }
 
 fn build_aliases_map(stacked_config: &StackedConfig) -> Result<RevsetAliasesMap> {
-    let table_name = ConfigNamePathBuf::from_iter(["revset-aliases"]);
-    build_generic_aliases_map(stacked_config, &table_name)
+    let mut warnings = vec![];
+    let aliases_map = config_util::load_revset_aliases(&mut warnings, stacked_config)?;
+    check_alias_warnings(&warnings)?;
+    Ok(aliases_map)
 }
 
 pub fn build_fileset_aliases_map(stacked_config: &StackedConfig) -> Result<FilesetAliasesMap> {
-    let table_name = ConfigNamePathBuf::from_iter(["fileset-aliases"]);
-    build_generic_aliases_map(stacked_config, &table_name)
+    let mut warnings = vec![];
+    let aliases_map = config_util::load_fileset_aliases(&mut warnings, stacked_config)?;
+    check_alias_warnings(&warnings)?;
+    Ok(aliases_map)
 }
 
-/// Like jj-cli's `load_aliases_map`, but with errors instead of warnings as we have no console.
-fn build_generic_aliases_map<P>(
-    stacked_config: &StackedConfig,
-    table_name: &ConfigNamePathBuf,
-) -> Result<AliasesMap<P, String>>
-where
-    P: AliasDeclarationParser + Default,
-    P::Error: std::fmt::Display,
-{
-    let mut aliases_map = AliasesMap::new();
-    // Load from all config layers in order. 'f(x)' in default layer should be overridden by 'f(a)' in user.
-    for layer in stacked_config.layers() {
-        let table = match layer.look_up_table(table_name) {
-            Ok(Some(table)) => table,
-            Ok(None) => continue,
-            Err(item) => {
-                return Err(ConfigGetError::Type {
-                    name: table_name.to_string(),
-                    error: format!("Expected a table, but is {}", item.type_name()).into(),
-                    source_path: layer.path.clone(),
-                }
-                .into());
-            }
-        };
-        for (decl, item) in table.iter() {
-            // an alias is either a bare definition string or a table carrying a `definition` plus optional `doc`
-            let (definition, doc) = match item.as_table_like() {
-                Some(t) => (
-                    t.get("definition").and_then(|i| i.as_str()),
-                    t.get("doc").and_then(|i| i.as_str()).map(str::to_owned),
-                ),
-                None => (item.as_str(), None),
-            };
-            let r = definition
-                .ok_or_else(|| {
-                    format!(
-                        "Expected a string or a table with a `definition` string key, but is {}",
-                        item.type_name()
-                    )
-                })
-                .and_then(|v| {
-                    aliases_map
-                        .insert(decl, v, doc)
-                        .map_err(|e: P::Error| e.to_string())
-                });
-            if let Err(s) = r {
-                return Err(anyhow!("Failed to load `{table_name}.{decl}`: {s}"));
-            }
-        }
+/// Fails on invalid aliases, which jj skips with a warning, since we have no console to show the
+/// warning on. Other warnings are logged.
+fn check_alias_warnings(warnings: &[ConfigWarning]) -> Result<()> {
+    if let Some(warning) = warnings
+        .iter()
+        .find(|warning| matches!(warning, ConfigWarning::InvalidAlias { .. }))
+    {
+        return Err(anyhow!("{warning}"));
     }
-    Ok(aliases_map)
+    log_config_warnings(warnings);
+    Ok(())
+}
+
+fn log_config_warnings(warnings: &[ConfigWarning]) {
+    for warning in warnings {
+        log::warn!("{warning}");
+    }
 }

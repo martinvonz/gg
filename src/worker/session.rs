@@ -17,7 +17,7 @@ use super::{
 };
 
 use crate::{
-    config::{GGSettings, read_config},
+    config::{GGSettings, WorkspaceLocation, read_config},
     messages,
 };
 
@@ -417,7 +417,10 @@ impl Session for WorkspaceSession<'_> {
                         self.data.aliases_map,
                         self.data.fileset_aliases_map,
                         self.data.query_choices,
-                    ) = read_config(Some(self.workspace.repo_path()))?;
+                    ) = read_config(Some(&WorkspaceLocation {
+                        workspace_root: self.workspace.workspace_root().to_owned(),
+                        repo_path: self.workspace.repo_path().to_owned(),
+                    }))?;
                 }
                 SessionEvent::WriteConfigTable { scope, key, values } => {
                     let name: ConfigNamePathBuf = key.iter().collect();
@@ -457,7 +460,10 @@ impl Session for WorkspaceSession<'_> {
                         self.data.aliases_map,
                         self.data.fileset_aliases_map,
                         self.data.query_choices,
-                    ) = read_config(Some(self.workspace.repo_path()))?;
+                    ) = read_config(Some(&WorkspaceLocation {
+                        workspace_root: self.workspace.workspace_root().to_owned(),
+                        repo_path: self.workspace.repo_path().to_owned(),
+                    }))?;
                 }
             };
         }

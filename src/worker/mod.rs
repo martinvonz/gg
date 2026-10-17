@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Error, Result, anyhow};
-use jj_cli::{git_util::load_git_import_options, revset_util, ui::Ui};
+use jj_frontend::{config_util, git_util::load_git_import_options};
 use jj_lib::default_backend_factories;
 use jj_lib::git::{self, GitFetch, GitFetchRefExpression, GitSettings};
 use jj_lib::ref_name::{RefNameBuf, RemoteName, RemoteNameBuf, RemoteRefSymbol};
@@ -252,11 +252,9 @@ impl WorkerSession {
         let mut auth_ctx = AuthContext::new(None);
         let git_settings = GitSettings::from_settings(&settings)?;
         let remote_settings = settings.remote_settings()?;
-        let import_options = load_git_import_options(&Ui::null(), &git_settings, &remote_settings)
-            .map_err(|e| Error::new(e.error))?;
+        let import_options = load_git_import_options(&mut vec![], &git_settings, &remote_settings)?;
         let tag_expr =
-            revset_util::parse_remote_fetch_tags(&Ui::null(), &remote_settings, remote_name)
-                .map_err(|e| Error::new(e.error))?
+            config_util::parse_remote_fetch_tags(&mut vec![], &remote_settings, remote_name)?
                 .unwrap_or_else(StringExpression::all);
 
         // perform sync git operations in with_callbacks, return the transaction for async finalization

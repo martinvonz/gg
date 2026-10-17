@@ -10,12 +10,12 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Error, Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use futures_util::TryStreamExt;
 use itertools::Itertools;
-use jj_cli::{cli_util::short_operation_hash, git_util::load_git_import_options, ui::Ui};
+use jj_cli::cli_util::short_operation_hash;
 use jj_frontend::{
-    git_util::is_colocated_git_workspace,
+    git_util::{is_colocated_git_workspace, load_git_import_options},
     revset_util::{self, default_ignored_remote_name},
 };
 use jj_lib::{
@@ -55,7 +55,7 @@ use thiserror::Error;
 use super::{WorkerSession, git_util::get_git_remote_names};
 
 use crate::{
-    config::{self, GGSettings, read_config},
+    config::{self, GGSettings, WorkspaceLocation, read_config},
     messages::{self, *},
 };
 
@@ -119,7 +119,10 @@ impl WorkerSession {
         let loader = factory.create(find_workspace_dir(cwd))?;
 
         let (settings, aliases_map, fileset_aliases_map, preset_choices) =
-            read_config(Some(loader.repo_path()))?;
+            read_config(Some(&WorkspaceLocation {
+                workspace_root: loader.workspace_root().to_owned(),
+                repo_path: loader.repo_path().to_owned(),
+            }))?;
 
         let workspace = loader.load(
             &settings,
@@ -1232,8 +1235,7 @@ impl WorkspaceSession<'_> {
     async fn import_git_refs(&mut self) -> Result<()> {
         let git_settings = GitSettings::from_settings(&self.data.workspace_settings)?;
         let remote_settings = self.data.workspace_settings.remote_settings()?;
-        let import_options = load_git_import_options(&Ui::null(), &git_settings, &remote_settings)
-            .map_err(|e| Error::new(e.error))?;
+        let import_options = load_git_import_options(&mut vec![], &git_settings, &remote_settings)?;
         let mut tx = self.operation.repo.start_transaction();
         let stats = git::import_refs(tx.repo_mut(), &import_options)
             .await
