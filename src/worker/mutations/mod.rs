@@ -4,19 +4,17 @@ mod revision;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{AsyncReadExt, TryStreamExt};
 use itertools::Itertools;
-use jj_cli::{
-    merge_tools::{self, ConflictResolveError, ExternalMergeTool, MergeEditor},
-    ui::Ui,
-};
 use jj_frontend::{
-    config_util,
+    config_util::{self, CommandNameAndArgs},
     git_util::load_git_import_options,
+    merge_tools::{self, ConflictResolveError, ExternalMergeTool, MergeEditor},
     operation_util::{UndoError, ViewPortions, find_undo_target, restore_operation},
 };
 use jj_lib::{
@@ -72,8 +70,7 @@ impl Mutation for ExternalDiff {
         let from_tree = rewrite::merge_commit_trees(ws.repo(), &parents).await?;
         let to_tree = commit.tree();
 
-        let tool_args: jj_cli::config::CommandNameAndArgs =
-            ws.data.workspace_settings.get("ui.diff-formatter")?;
+        let tool_args: CommandNameAndArgs = ws.data.workspace_settings.get("ui.diff-formatter")?;
         let tool = if let Some(name) = tool_args.as_str() {
             merge_tools::get_external_tool_config(&ws.data.workspace_settings, name)?
                 .unwrap_or_else(|| ExternalMergeTool::with_program(name))
@@ -123,14 +120,16 @@ impl Mutation for ExternalDiff {
                     ("width", OsString::from("80")),
                 ]);
 
-                let ui = Ui::null();
-                merge_tools::invoke_external_diff(
-                    &ui,
+                let unexpected_exit_status = merge_tools::invoke_external_diff(
                     &mut std::io::sink(),
+                    Stdio::null(),
                     &tool,
                     temp_dir.path(),
                     &patterns,
                 )?;
+                if let Some(exit_status) = unexpected_exit_status {
+                    log::warn!("external diff tool exited with {exit_status}");
+                }
                 Ok(())
             };
             if let Err(e) = run() {
@@ -158,19 +157,26 @@ impl Mutation for ExternalResolve {
         let tree = commit.tree();
         let repo_path = RepoPath::from_internal_string(&self.path.repo_path)?;
 
-        let ui = Ui::null();
         let merge_editor = MergeEditor::from_settings(
-            &ui,
+            &mut vec![],
             &ws.data.workspace_settings,
-            ws.env().path_converter().clone(),
             ConflictMarkerStyle::Git,
         )
         .context("failed to load merge editor config")?;
 
-        let (new_tree, _partial) = match merge_editor.edit_files(&ui, &tree, &[repo_path]).await {
+        let (new_tree, _partial) = match merge_editor
+            .edit_files(&mut |_| {}, &tree, &[repo_path])
+            .await
+        {
             Ok(result) => result,
             Err(ConflictResolveError::EmptyOrUnchanged) => {
                 return Ok(MutationResult::Unchanged);
+            }
+            Err(ConflictResolveError::BuiltinToolNotAvailable) => {
+                precondition!(
+                    "The `:builtin` merge tool can't be used from gg. Set `ui.merge-editor` to an \
+                     external merge tool."
+                );
             }
             Err(err) => return Err(err.into()),
         };

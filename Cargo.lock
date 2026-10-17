@@ -3763,6 +3763,7 @@ name = "jj-cli"
 version = "0.46.0"
 dependencies = [
  "ansi-to-tui",
+ "async-trait",
  "bstr",
  "clap",
  "clap-markdown",
@@ -3872,6 +3873,8 @@ dependencies = [
 name = "jj-frontend"
 version = "0.46.0"
 dependencies = [
+ "async-trait",
+ "bstr",
  "dunce",
  "etcetera",
  "futures 0.3.34",
@@ -3879,9 +3882,14 @@ dependencies = [
  "itertools 0.15.0",
  "jiff",
  "jj-lib",
+ "maplit",
  "pollster",
  "rand 0.10.3",
  "rand_chacha",
+ "regex",
+ "serde",
+ "shlex",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
  "whoami",

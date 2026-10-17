@@ -1185,7 +1185,7 @@ fn build_ref_index(repo: &ReadonlyRepo) -> RefIndex {
 /// checks whether a jj config key points to an external (non-builtin) tool
 fn has_external_tool(settings: &UserSettings, config_key: &'static str) -> bool {
     settings
-        .get::<jj_cli::config::CommandNameAndArgs>(config_key)
+        .get::<jj_frontend::config_util::CommandNameAndArgs>(config_key)
         .ok()
         .map(|tool| !matches!(tool.as_str(), Some(s) if s.is_empty() || s.starts_with(':')))
         .unwrap_or(false)
