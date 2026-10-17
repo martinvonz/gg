@@ -64,7 +64,6 @@ tauri-plugin-window-state = "2.0.0"
 tauri-plugin-log = "2.0.0"
 
 jj-lib = { path = "../jj/lib", features = ["watchman"] }
-jj-cli = { path = "../jj/cli" }
 jj-frontend = { path = "../jj/frontend", features = ["git"] }
 
 # deps shared with JJ, which we try to keep on the same version

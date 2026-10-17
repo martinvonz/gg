@@ -1,5 +1,5 @@
-//! Analogous to cli_util from jj-cli
-//! We reuse a bit of jj-cli code, but many of its modules include TUI concerns or are not suitable for a long-running server
+//! Analogous to cli_util from jj-cli. The UI-agnostic parts, such as snapshotting and finishing
+//! transactions, come from jj-frontend's `WorkspaceOperationRunner`.
 
 use std::{
     cell::OnceCell,
