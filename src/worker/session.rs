@@ -16,10 +16,7 @@ use super::{
     queries::{self, QuerySession, QueryState},
 };
 
-use crate::{
-    config::{GGSettings, WorkspaceLocation, read_config},
-    messages,
-};
+use crate::{config::GGSettings, messages};
 
 /// A state in the worker thread's event loop.
 ///
@@ -392,7 +389,7 @@ impl Session for WorkspaceSession<'_> {
                                 .map(|p| p.to_path_buf())
                                 .ok_or_else(|| anyhow!("No user config path found to edit")),
                             ConfigSource::Repo => {
-                                config_env.reset_repo_path(self.workspace.repo_path());
+                                config_env.reset_repo_path(self.workspace().repo_path());
                                 config_env
                                     .repo_config_path(&mut vec![])
                                     .map_err(|e| anyhow!("{e:?}"))?
@@ -412,15 +409,7 @@ impl Session for WorkspaceSession<'_> {
                         log::warn!("Failed to write config array: {err:#}");
                     }
 
-                    (
-                        self.data.workspace_settings,
-                        self.data.aliases_map,
-                        self.data.fileset_aliases_map,
-                        self.data.query_choices,
-                    ) = read_config(Some(&WorkspaceLocation {
-                        workspace_root: self.workspace.workspace_root().to_owned(),
-                        repo_path: self.workspace.repo_path().to_owned(),
-                    }))?;
+                    self.reload_config()?;
                 }
                 SessionEvent::WriteConfigTable { scope, key, values } => {
                     let name: ConfigNamePathBuf = key.iter().collect();
@@ -433,7 +422,7 @@ impl Session for WorkspaceSession<'_> {
                                 .map(|p| p.to_path_buf())
                                 .ok_or_else(|| anyhow!("No user config path found to edit")),
                             ConfigSource::Repo => {
-                                config_env.reset_repo_path(self.workspace.repo_path());
+                                config_env.reset_repo_path(self.workspace().repo_path());
                                 config_env
                                     .repo_config_path(&mut vec![])
                                     .map_err(|e| anyhow!("{e:?}"))?
@@ -455,15 +444,7 @@ impl Session for WorkspaceSession<'_> {
                         log::warn!("Failed to write config table: {err:#}");
                     }
 
-                    (
-                        self.data.workspace_settings,
-                        self.data.aliases_map,
-                        self.data.fileset_aliases_map,
-                        self.data.query_choices,
-                    ) = read_config(Some(&WorkspaceLocation {
-                        workspace_root: self.workspace.workspace_root().to_owned(),
-                        repo_path: self.workspace.repo_path().to_owned(),
-                    }))?;
+                    self.reload_config()?;
                 }
             };
         }

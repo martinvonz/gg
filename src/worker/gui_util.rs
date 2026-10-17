@@ -13,10 +13,13 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use futures_util::TryStreamExt;
 use itertools::Itertools;
-use jj_cli::cli_util::short_operation_hash;
 use jj_frontend::{
-    git_util::{is_colocated_git_workspace, load_git_import_options},
     revset_util::{self, default_ignored_remote_name},
+    runner::{
+        RunnerError, RunnerEvent, RunnerEvents, RunnerOptions, SnapshotConfig,
+        SnapshotConfigDiagnostics, WorkspaceOperationRunner,
+    },
+    workspace_env::{WorkspaceEnvironment, WorkspaceEnvironmentDiagnostics},
 };
 use jj_lib::{
     backend::{BackendError, ChangeId, CommitId},
@@ -24,17 +27,13 @@ use jj_lib::{
     default_backend_factories,
     default_index::DefaultReadonlyIndex,
     file_util,
-    fileset::{self, FilesetAliasesMap, FilesetDiagnostics, FilesetParseContext},
-    git::{self, GitSettings, REMOTE_NAME_FOR_LOCAL_GIT_REPO},
+    fileset::FilesetAliasesMap,
+    git::{self, REMOTE_NAME_FOR_LOCAL_GIT_REPO},
     git_backend::GitBackend,
-    gitignore::GitIgnoreFile,
     id_prefix::{IdPrefixContext, IdPrefixIndex},
-    matchers::{Matcher, NothingMatcher},
     object_id::ObjectId,
-    op_heads_store,
-    operation::Operation,
     ref_name::{WorkspaceName, WorkspaceNameBuf},
-    repo::{ReadonlyRepo, Repo, RepoLoaderError},
+    repo::{ReadonlyRepo, Repo},
     repo_path::RepoPath,
     revset::{
         self, Revset, RevsetAliasesMap, RevsetDiagnostics, RevsetEvaluationError, RevsetExpression,
@@ -42,11 +41,10 @@ use jj_lib::{
         RevsetWorkspaceContext, SymbolResolverExtension, UserRevsetExpression,
     },
     rewrite,
-    settings::{HumanByteSize, UserSettings},
+    settings::UserSettings,
     transaction::Transaction,
     ui_path::RepoPathUiConverter,
     view::View,
-    working_copy::{CheckoutStats, SnapshotOptions, WorkingCopyFreshness},
     workspace::{DefaultWorkspaceLoaderFactory, Workspace, WorkspaceLoaderFactory},
 };
 use pollster::FutureExt as _;
@@ -69,9 +67,10 @@ use crate::{
 pub struct WorkspaceSession<'a> {
     pub session: &'a mut WorkerSession,
 
-    // workspace-level data, initialised once
-    pub(crate) workspace: Workspace,
+    // workspace-level data, initialised once (and again when the config changes)
+    runner: WorkspaceOperationRunner,
     pub(crate) data: WorkspaceData,
+    snapshot_config: SnapshotConfig,
     is_large: bool, // this is based on the head operation and thus derived from the rest of the data
     is_colocated: bool, // theoretically operation-specific but we don't support switching horses
 
@@ -144,7 +143,17 @@ impl WorkerSession {
             query_choices: preset_choices,
         };
 
-        let operation = load_at_head(&workspace, &data).await?;
+        let env = new_workspace_environment(&workspace, &data)?;
+        let snapshot_config = load_snapshot_config(&workspace, &env)?;
+        let runner = WorkspaceOperationRunner::load_at_head(
+            &LogRunnerEvents,
+            workspace,
+            env,
+            runner_options(),
+        )
+        .await?;
+        let operation = OperationData::new(runner.workspace_name(), &data, runner.repo().clone());
+        let workspace = runner.workspace();
 
         let index_store = workspace.repo_loader().index_store();
         let index = index_store
@@ -157,12 +166,13 @@ impl WorkerSession {
             true
         };
 
-        let is_colocated = is_colocated_git_workspace(&workspace)?;
+        let is_colocated = runner.env().working_copy_shared_with_git();
 
         Ok(WorkspaceSession {
             session: self,
-            workspace,
+            runner,
             data,
+            snapshot_config,
             is_large,
             is_colocated,
             operation,
@@ -172,7 +182,55 @@ impl WorkerSession {
 
 impl WorkspaceSession<'_> {
     pub fn name(&self) -> &WorkspaceName {
-        self.workspace.workspace_name()
+        self.runner.workspace_name()
+    }
+
+    pub(crate) fn workspace(&self) -> &Workspace {
+        self.runner.workspace()
+    }
+
+    /// Re-reads the configuration after it has been changed. The workspace is reloaded so that it
+    /// uses the new settings.
+    pub(crate) fn reload_config(&mut self) -> Result<()> {
+        let workspace_root = self.runner.workspace_root().to_owned();
+        let loader = DefaultWorkspaceLoaderFactory.create(&workspace_root)?;
+        (
+            self.data.workspace_settings,
+            self.data.aliases_map,
+            self.data.fileset_aliases_map,
+            self.data.query_choices,
+        ) = read_config(Some(&WorkspaceLocation {
+            workspace_root,
+            repo_path: loader.repo_path().to_owned(),
+        }))?;
+        let workspace = loader.load(
+            &self.data.workspace_settings,
+            &default_backend_factories::default_backend_factories(),
+            &default_backend_factories::default_working_copy_factories(),
+        )?;
+        let env = new_workspace_environment(&workspace, &self.data)?;
+        self.snapshot_config = load_snapshot_config(&workspace, &env)?;
+        let repo = self.runner.repo().clone();
+        self.runner = WorkspaceOperationRunner::load_at(
+            &LogRunnerEvents,
+            workspace,
+            repo,
+            env,
+            runner_options(),
+            true,
+        )?;
+        self.operation = OperationData::new(self.name(), &self.data, self.runner.repo().clone());
+        Ok(())
+    }
+
+    /// Updates the data derived from the current operation if the runner has moved to a new
+    /// operation. Returns whether it had.
+    fn sync_operation(&mut self) -> bool {
+        if self.runner.repo().op_id() == self.operation.repo.op_id() {
+            return false;
+        }
+        self.operation = OperationData::new(self.name(), &self.data, self.runner.repo().clone());
+        true
     }
 
     pub fn wc_id(&self) -> &CommitId {
@@ -206,7 +264,7 @@ impl WorkspaceSession<'_> {
 
         let (mut new_workspace, repo) = Workspace::init_workspace_with_existing_repo(
             &path,
-            self.workspace.repo_path(),
+            self.workspace().repo_path(),
             &self.operation.repo,
             &*default_backend_factories::default_working_copy_factory(),
             workspace_name.clone(),
@@ -280,7 +338,7 @@ impl WorkspaceSession<'_> {
         let workspace_store = tx.base_repo().loader().workspace_store().clone();
         let is_colocated = self.is_colocated;
 
-        let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
+        let (mut locked_ws, _) = self.runner.start_working_copy_mutation().await?;
 
         locked_ws.locked_wc().rename_workspace(new_name.clone());
         tx.repo_mut()
@@ -292,19 +350,17 @@ impl WorkspaceSession<'_> {
             git::export_refs(tx.repo_mut())?;
         }
 
-        self.operation = OperationData::new(
-            &new_name,
-            &self.data,
-            tx.commit(format!(
+        let repo = tx
+            .commit(format!(
                 "rename workspace '{}' to '{}'",
                 old_name.as_symbol(),
                 new_name.as_symbol()
             ))
-            .await?,
-        );
-        locked_ws
-            .finish(self.operation.repo.op_id().clone())
             .await?;
+        locked_ws.finish(repo.op_id().clone()).await?;
+
+        self.runner.reload_at_head(&LogRunnerEvents).await?;
+        self.sync_operation();
 
         Ok(Some(self.format_status()))
     }
@@ -320,10 +376,10 @@ impl WorkspaceSession<'_> {
 
         // the loaded workspace knows where it is without consulting the store
         if *workspace_name == *self.name() {
-            return absolute_workspace_path(self.workspace.workspace_root());
+            return absolute_workspace_path(self.workspace().workspace_root());
         }
 
-        let repo_path = self.workspace.repo_path();
+        let repo_path = self.workspace().repo_path();
         let workspace_store = self.operation.repo.loader().workspace_store();
 
         match workspace_store.get_workspace_path(&workspace_name)? {
@@ -379,13 +435,8 @@ impl WorkspaceSession<'_> {
     }
 
     pub(crate) async fn load_at_head(&mut self) -> Result<bool> {
-        let head = load_at_head(&self.workspace, &self.data).await?;
-        if head.repo.op_id() != self.operation.repo.op_id() {
-            self.operation = head;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.runner.reload_at_head(&LogRunnerEvents).await?;
+        Ok(self.sync_operation())
     }
 
     /***********************************************************/
@@ -648,7 +699,7 @@ impl WorkspaceSession<'_> {
 
     fn parse_context(&self) -> RevsetParseContext<'_> {
         self.data
-            .parse_context(self.workspace.workspace_name(), self.repo().store())
+            .parse_context(self.workspace().workspace_name(), self.repo().store())
     }
 
     // the prefix context caches this itself, but the way it does so is not convenient for us - you need a fallible method and the &dyn Repo
@@ -692,7 +743,7 @@ impl WorkspaceSession<'_> {
      ************************************/
 
     pub(crate) fn format_config(&self) -> Result<messages::RepoConfig> {
-        let absolute_path = self.workspace.workspace_root().into();
+        let absolute_path = self.workspace().workspace_root().into();
 
         let git_remotes = match self.git_repo() {
             Some(repo) => get_git_remote_names(&repo),
@@ -860,7 +911,7 @@ impl WorkspaceSession<'_> {
         &self,
         repo_path: T,
     ) -> Result<messages::TreePath> {
-        let base_path = self.workspace.workspace_root();
+        let base_path = self.workspace().workspace_root();
         let relative_path =
             file_util::relative_path(base_path, &repo_path.as_ref().to_fs_path(base_path)?);
         Ok(messages::TreePath {
@@ -918,7 +969,7 @@ impl WorkspaceSession<'_> {
             .get_bool("snapshot.auto-update-stale")
             .unwrap_or(false);
         self.import_and_snapshot(true, auto_update_stale).await?;
-        Ok(self.operation.repo.start_transaction())
+        Ok(self.runner.start_transaction())
     }
 
     /// Finish a transaction, protecting against the working copy landing on an immutable commit.
@@ -934,13 +985,13 @@ impl WorkspaceSession<'_> {
     }
 
     /// Finish a transaction with control over immutability checking.
-    /// If `ignore_immutable` is false, and rebase_descendants() causes the working copy to land
-    /// on an immutable commit, a new commit is created on top to prevent accidental modification.
-    /// Pass `ignore_immutable: true` only for explicit "edit" gestures (double-click, Enter, Edit
-    /// button) where the user has deliberately chosen to edit an immutable commit.
+    /// If `ignore_immutable` is false, and the working copy lands on an immutable commit, a new
+    /// commit is created on top to prevent accidental modification. Pass `ignore_immutable: true`
+    /// only for explicit "edit" gestures (double-click, Enter, Edit button) where the user has
+    /// deliberately chosen to edit an immutable commit.
     pub(crate) async fn finish_transaction_for_edit(
         &mut self,
-        mut tx: Transaction,
+        tx: Transaction,
         description: impl Into<String>,
         ignore_immutable: bool,
     ) -> Result<Option<messages::RepoStatus>> {
@@ -948,58 +999,20 @@ impl WorkspaceSession<'_> {
             return Ok(None);
         }
 
-        tx.repo_mut().rebase_descendants().await?;
-        for (name, wc_commit_id) in &tx.repo().view().wc_commit_ids().clone() {
-            if !ignore_immutable
-                && self.check_immutable_with_repo(tx.repo(), [wc_commit_id.clone()])?
-            {
-                let wc_commit = tx.repo().store().get_commit(wc_commit_id)?;
-                tx.repo_mut().check_out(name.clone(), &wc_commit).await?;
-                log::debug!(
-                    "The working-copy commit in workspace '{name}' became immutable, so a new \
-                                 commit has been created on top of it.",
-                    name = name.as_symbol()
-                );
-            }
-        }
-
-        let old_repo = tx.base_repo().clone();
-
-        let maybe_old_wc_commit = old_repo
-            .view()
-            .get_wc_commit_id(self.workspace.workspace_name())
-            .map(|commit_id| tx.base_repo().store().get_commit(commit_id))
-            .transpose()?;
-        let maybe_new_wc_commit = tx
-            .repo()
-            .view()
-            .get_wc_commit_id(self.workspace.workspace_name())
-            .map(|commit_id| tx.repo().store().get_commit(commit_id))
-            .transpose()?;
-        if self.is_colocated {
-            if let Some(wc_commit) = &maybe_new_wc_commit {
-                git::reset_head(
-                    tx.repo_mut(),
-                    self.workspace.workspace_name(),
-                    self.workspace.workspace_root(),
-                    wc_commit,
-                )
-                .await?;
-            }
-            git::export_refs(tx.repo_mut())?;
-        }
-
-        self.operation = OperationData::new(self.name(), &self.data, tx.commit(description).await?);
-
-        // XXX do this only if loaded at head, which is currently always true, but won't be once we have undo-redo
-        if let Some(new_commit) = &maybe_new_wc_commit {
-            self.update_working_copy(maybe_old_wc_commit.as_ref(), new_commit)
-                .await?;
-        }
+        self.runner.set_ignore_immutable(ignore_immutable);
+        let result = self
+            .runner
+            .finish_transaction(&LogRunnerEvents, tx, description)
+            .await;
+        self.runner.set_ignore_immutable(false);
+        self.sync_operation();
+        result?;
 
         Ok(Some(self.format_status()))
     }
 
+    /// Imports from Git and snapshots the working copy, unless automatic snapshots are disabled
+    /// and `force` is false. Returns whether the repo changed.
     pub(crate) async fn import_and_snapshot(
         &mut self,
         force: bool,
@@ -1015,240 +1028,24 @@ impl WorkspaceSession<'_> {
             return Ok(false);
         }
 
-        if self.is_colocated {
-            self.import_git_head().await?;
-        }
-
-        let updated_working_copy = self.snapshot_working_copy(auto_update_stale).await?;
-
-        if self.is_colocated {
-            self.import_git_refs().await?;
-        }
-
-        Ok(updated_working_copy)
-    }
-
-    async fn snapshot_working_copy(&mut self, auto_update_stale: bool) -> Result<bool> {
-        let workspace_name = self.workspace.workspace_name().to_owned();
-        let get_wc_commit = |repo: &ReadonlyRepo| -> Result<Option<_>, _> {
-            repo.view()
-                .get_wc_commit_id(&workspace_name)
-                .map(|id| repo.store().get_commit(id))
-                .transpose()
-        };
-        let repo = self.operation.repo.clone();
-        let Some(wc_commit) = get_wc_commit(&repo)? else {
-            return Ok(false); // The workspace has been deleted
-        };
-
-        let base_ignores = self
-            .operation
-            .base_ignores(self.workspace.workspace_root())?;
-
-        // Compare working-copy tree and operation with repo's, and reload as needed.
-        let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
-        let old_op_id = locked_ws.locked_wc().old_operation_id().clone();
-        let (repo, wc_commit) = match WorkingCopyFreshness::check_stale(
-            locked_ws.locked_wc(),
-            &wc_commit,
-            &repo,
-        )
-        .await?
-        {
-            WorkingCopyFreshness::Fresh => (repo, wc_commit),
-            WorkingCopyFreshness::Updated(wc_operation) => {
-                let repo = repo.reload_at(&wc_operation).await?;
-                let wc_commit = if let Some(wc_commit) = get_wc_commit(&repo)? {
-                    wc_commit
-                } else {
-                    return Ok(false);
-                };
-                (repo, wc_commit)
-            }
-            WorkingCopyFreshness::WorkingCopyStale => {
-                if !auto_update_stale {
-                    return Err(anyhow!(
-                        "The working copy is stale (not updated since operation {}). Run `jj workspace update-stale` to update it.",
-                        short_operation_hash(&old_op_id)
-                    ));
-                }
-
-                log::info!(
-                    "Updating stale working copy (last updated at operation {})",
-                    short_operation_hash(&old_op_id)
-                );
-
-                let new_wc_commit = wc_commit;
-                let old_op = repo.op_store().read_operation(&old_op_id).await?;
-                let old_view = repo.op_store().read_view(&old_op.view_id).await?;
-                let old_wc_commit = old_view
-                    .wc_commit_ids
-                    .get(&workspace_name)
-                    .map(|id| repo.store().get_commit(id))
-                    .transpose()?;
-                let old_tree = old_wc_commit.as_ref().map(|c: &Commit| c.tree());
-
-                // drop the lock, checkout, reacquire and and restart the mutation
-                drop(locked_ws);
-                self.workspace
-                    .check_out(repo.op_id().clone(), old_tree.as_ref(), &new_wc_commit)
-                    .await?;
-                locked_ws = self.workspace.start_working_copy_mutation().await?;
-
-                (repo, new_wc_commit)
-            }
-            WorkingCopyFreshness::SiblingOperation => {
-                return Err(anyhow!(
-                    "The repo was loaded at operation {}, which seems to be a sibling of the working copy's operation {}",
-                    short_operation_hash(repo.op_id()),
-                    short_operation_hash(&old_op_id)
-                ));
-            }
-        };
-
-        let HumanByteSize(mut max_new_file_size) = self
-            .data
-            .workspace_settings
-            .get_value_with("snapshot.max-new-file-size", TryInto::try_into)?;
-        if max_new_file_size == 0 {
-            max_new_file_size = u64::MAX;
-        }
-
-        let (new_tree_id, _) = locked_ws
-            .locked_wc()
-            .snapshot(&SnapshotOptions {
-                base_ignores,
-                progress: None,
-                max_new_file_size,
-                start_tracking_matcher: self.data.auto_tracking_matcher()?.as_ref(),
-                force_tracking_matcher: &NothingMatcher,
-            })
-            .await?;
-
-        let did_anything = new_tree_id.tree_ids() != wc_commit.tree_ids();
-
-        if did_anything {
-            let mut tx = repo.start_transaction();
-            let mut_repo = tx.repo_mut();
-            let commit = mut_repo
-                .rewrite_commit(&wc_commit)
-                .set_tree(new_tree_id)
-                .write()
-                .await?;
-            mut_repo.set_wc_commit(workspace_name.clone(), commit.id().clone())?;
-
-            mut_repo.rebase_descendants().await?;
-
-            if self.is_colocated {
-                git::export_refs(mut_repo)?;
-            }
-
-            self.operation = OperationData::new(
-                &workspace_name,
-                &self.data,
-                tx.commit("snapshot working copy").await?,
-            );
-        }
-
-        locked_ws
-            .finish(self.operation.repo.op_id().clone())
-            .await?;
-
-        Ok(did_anything)
-    }
-
-    async fn update_working_copy(
-        &mut self,
-        maybe_old_commit: Option<&Commit>,
-        new_commit: &Commit,
-    ) -> Result<Option<CheckoutStats>> {
-        let old_tree = maybe_old_commit.map(|commit| commit.tree());
-
-        Ok(
-            if Some(new_commit.tree_ids()) != old_tree.as_ref().map(|t| t.tree_ids()) {
-                Some(
-                    self.workspace
-                        .check_out(
-                            self.operation.repo.op_id().clone(),
-                            old_tree.as_ref(),
-                            new_commit,
-                        )
-                        .await?,
-                )
-            } else {
-                let locked_ws = self.workspace.start_working_copy_mutation().await?;
-                locked_ws
-                    .finish(self.operation.repo.op_id().clone())
-                    .await?;
-                None
-            },
-        )
-    }
-
-    async fn import_git_head(&mut self) -> Result<()> {
-        let workspace_name = self.workspace.workspace_name().to_owned();
-        let mut tx = self.operation.repo.start_transaction();
-        git::import_head(
-            tx.repo_mut(),
-            &workspace_name,
-            self.workspace.workspace_root(),
-        )
-        .await?;
-        if !tx.repo().has_changes() {
-            return Ok(());
-        }
-
-        let new_git_head = tx.repo().view().git_head(&workspace_name).clone();
-        if let Some(new_git_head_id) = new_git_head.as_normal() {
-            if let Some(old_wc_commit_id) =
-                self.operation.repo.view().get_wc_commit_id(&workspace_name)
-            {
-                let old_wc_commit = tx.repo().store().get_commit(old_wc_commit_id)?;
-                tx.repo_mut().record_abandoned_commit(&old_wc_commit);
-            }
-
-            let new_git_head_commit = tx.repo().store().get_commit(new_git_head_id)?;
-            tx.repo_mut()
-                .check_out(workspace_name.clone(), &new_git_head_commit)
-                .await?;
-
-            let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
-
-            locked_ws.locked_wc().reset(&new_git_head_commit).await?;
-            tx.repo_mut().rebase_descendants().await?;
-
-            self.operation = OperationData::new(
-                &workspace_name,
-                &self.data,
-                tx.commit("import git head").await?,
-            );
-
-            locked_ws
-                .finish(self.operation.repo.op_id().clone())
-                .await?;
-        } else {
-            self.finish_transaction(tx, "import git head").await?;
-        }
-        Ok(())
-    }
-
-    async fn import_git_refs(&mut self) -> Result<()> {
-        let git_settings = GitSettings::from_settings(&self.data.workspace_settings)?;
-        let remote_settings = self.data.workspace_settings.remote_settings()?;
-        let import_options = load_git_import_options(&mut vec![], &git_settings, &remote_settings)?;
-        let mut tx = self.operation.repo.start_transaction();
-        let stats = git::import_refs(tx.repo_mut(), &import_options)
+        let lock = self.runner.lock_git_import_export()?;
+        let result = match self
+            .runner
+            .snapshot(&LogRunnerEvents, &self.snapshot_config, &lock)
             .await
-            .context("automated import failed despite reserved remote name")?;
-        if !tx.repo().has_changes() {
-            return Ok(());
-        }
-
-        tx.repo_mut().rebase_descendants().await?;
-
-        self.finish_transaction(tx, format!("import git refs: {:?}", stats))
-            .await?;
-        Ok(())
+        {
+            Err(RunnerError::StaleWorkingCopy(err)) if auto_update_stale => {
+                log::info!("Updating stale working copy: {err}");
+                self.runner
+                    .recover_stale(&LogRunnerEvents, &self.snapshot_config, &lock)
+                    .await
+            }
+            result => result,
+        };
+        drop(lock);
+        let changed = self.sync_operation();
+        result?;
+        Ok(changed)
     }
 }
 
@@ -1280,25 +1077,6 @@ impl WorkspaceData {
             extensions: &self.extensions,
             workspace: Some(workspace_context),
         }
-    }
-
-    pub fn auto_tracking_matcher(&self) -> Result<Box<dyn Matcher>> {
-        let pattern = self
-            .workspace_settings
-            .get_string("snapshot.auto-track")
-            .unwrap_or_else(|_| "all()".to_string()); // same default as jj-cli
-
-        let mut diagnostics = FilesetDiagnostics::new();
-        let parse_context = FilesetParseContext {
-            aliases_map: &self.fileset_aliases_map,
-            path_converter: &self.path_converter,
-        };
-        let expression = fileset::parse(&mut diagnostics, &pattern, &parse_context)?;
-        if let Some(diagnostic) = diagnostics.into_iter().next() {
-            return Err(anyhow!("snapshot.auto-track: {}", diagnostic));
-        }
-
-        Ok(expression.to_matcher())
     }
 }
 
@@ -1339,48 +1117,6 @@ impl OperationData {
 
     fn git_backend(&self) -> Option<&GitBackend> {
         self.repo.store().backend_impl::<GitBackend>()
-    }
-
-    pub fn base_ignores(&self, workspace_root: &Path) -> Result<Arc<GitIgnoreFile>> {
-        let home_dir = etcetera::home_dir().ok();
-        fn xdg_config_home() -> Option<PathBuf> {
-            if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
-                && !x.is_empty()
-            {
-                return Some(PathBuf::from(x));
-            }
-            etcetera::home_dir().ok().map(|home| home.join(".config"))
-        }
-
-        let get_excludes_file_path = |config: &gix::config::File| -> Option<PathBuf> {
-            if let Some(value) = config.string("core.excludesFile") {
-                let path = std::str::from_utf8(&value)
-                    .ok()
-                    .map(|path| file_util::expand_home_path(path, home_dir.as_deref()))?;
-                Some(workspace_root.join(path))
-            } else {
-                xdg_config_home().map(|x| x.join("git").join("ignore"))
-            }
-        };
-
-        let mut git_ignores = GitIgnoreFile::empty();
-        if let Some(git_backend) = self.git_backend() {
-            let git_repo = git_backend.git_repo();
-            if let Some(excludes_file_path) =
-                get_excludes_file_path(git_repo.config_snapshot().plumbing())
-            {
-                git_ignores = git_ignores.chain_with_file(RepoPath::root(), excludes_file_path)?;
-            }
-            git_ignores = git_ignores.chain_with_file(
-                RepoPath::root(),
-                git_backend.git_repo_path().join("info").join("exclude"),
-            )?;
-        } else if let Ok(git_config) = gix::config::File::from_globals()
-            && let Some(excludes_file_path) = get_excludes_file_path(&git_config)
-        {
-            git_ignores = git_ignores.chain_with_file(RepoPath::root(), excludes_file_path)?;
-        }
-        Ok(git_ignores)
     }
 }
 
@@ -1530,27 +1266,58 @@ fn has_external_tool(settings: &UserSettings, config_key: &'static str) -> bool 
 /* misc helpers that should be better organised */
 /************************************************/
 
-async fn load_at_head(workspace: &Workspace, data: &WorkspaceData) -> Result<OperationData> {
-    let loader = workspace.repo_loader();
+fn runner_options() -> RunnerOptions {
+    RunnerOptions {
+        ignore_working_copy: false,
+        integrate_operation: true,
+        ignore_immutable: false,
+        merge_concurrent_operations: true,
+        transaction_attributes: vec![],
+    }
+}
 
-    let op = op_heads_store::resolve_op_heads(
-        loader.op_heads_store().as_ref(),
-        loader.op_store(),
-        async |op_heads| {
-            // might want to set some tags
-            let (merged_repo, _num_rebased) = loader
-                .merge_operations(op_heads, None, Some("resolve concurrent operations"), [])
-                .await?;
-            Ok::<Operation, RepoLoaderError>(merged_repo.operation().clone())
-        },
-    )
-    .await?;
+fn new_workspace_environment(
+    workspace: &Workspace,
+    data: &WorkspaceData,
+) -> Result<Arc<WorkspaceEnvironment>> {
+    let mut diagnostics = WorkspaceEnvironmentDiagnostics::new();
+    let env = WorkspaceEnvironment::new(
+        &mut diagnostics,
+        workspace,
+        workspace.workspace_root(),
+        Arc::new(RevsetExtensions::default()),
+        data.fileset_aliases_map.clone(),
+        data.aliases_map.clone(),
+    )?;
+    log::debug!("{diagnostics:?}");
+    Ok(Arc::new(env))
+}
 
-    let repo: Arc<ReadonlyRepo> = workspace
-        .repo_loader()
-        .load_at(&op)
-        .await
-        .context("load op head")?;
+fn load_snapshot_config(
+    workspace: &Workspace,
+    env: &WorkspaceEnvironment,
+) -> Result<SnapshotConfig> {
+    let mut diagnostics = SnapshotConfigDiagnostics::new();
+    let home_dir = etcetera::home_dir().ok();
+    let config = SnapshotConfig::load(
+        &mut diagnostics,
+        env,
+        workspace.repo_loader().store(),
+        home_dir.as_deref(),
+    )?;
+    log::debug!("{diagnostics:?}");
+    Ok(config)
+}
 
-    Ok(OperationData::new(workspace.workspace_name(), data, repo))
+/// Logs the events reported by the runner, since there's no console to print them on.
+struct LogRunnerEvents;
+
+impl RunnerEvents for LogRunnerEvents {
+    fn event(
+        &self,
+        event: RunnerEvent<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log::info!("{event:?}");
+        Ok(())
+    }
 }
