@@ -7,8 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::FutureExt;
-use jj_cli::config::ConfigEnv;
-use jj_cli::ui::Ui;
+use jj_frontend::config_env::ConfigEnv;
 use jj_lib::config::{ConfigNamePathBuf, ConfigSource};
 
 use super::{
@@ -395,7 +394,7 @@ impl Session for WorkspaceSession<'_> {
                             ConfigSource::Repo => {
                                 config_env.reset_repo_path(self.workspace.repo_path());
                                 config_env
-                                    .repo_config_path(&Ui::null())
+                                    .repo_config_path(&mut vec![])
                                     .map_err(|e| anyhow!("{e:?}"))?
                                     .ok_or_else(|| anyhow!("No repo config path available"))
                             }
@@ -433,7 +432,7 @@ impl Session for WorkspaceSession<'_> {
                             ConfigSource::Repo => {
                                 config_env.reset_repo_path(self.workspace.repo_path());
                                 config_env
-                                    .repo_config_path(&Ui::null())
+                                    .repo_config_path(&mut vec![])
                                     .map_err(|e| anyhow!("{e:?}"))?
                                     .ok_or_else(|| anyhow!("No repo config path available"))
                             }

@@ -3,6 +3,7 @@ mod r#ref;
 mod revision;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::sync::Arc;
 
 use anyhow::{Context, Error, Result};
@@ -19,6 +20,7 @@ use jj_lib::{
     backend::{CommitId, TreeValue},
     conflicts::{self, ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue},
     files::FileMergeHunkLevel,
+    files::MergeOptions,
     git::{
         self, GitFetchRefExpression, GitPushOptions, GitPushRefTargets, GitSettings,
         GitSubprocessOptions, REMOTE_NAME_FOR_LOCAL_GIT_REPO,
@@ -36,7 +38,6 @@ use jj_lib::{
     rewrite::{self},
     store::Store,
     str_util::StringExpression,
-    tree_merge::MergeOptions,
 };
 use pollster::FutureExt as _;
 
@@ -105,17 +106,19 @@ impl Mutation for ExternalDiff {
                 let left_rel = left_path
                     .strip_prefix(temp_dir.path())
                     .unwrap()
-                    .as_os_str()
+                    .to_str()
+                    .unwrap()
                     .to_owned();
                 let right_rel = right_path
                     .strip_prefix(temp_dir.path())
                     .unwrap()
-                    .as_os_str()
+                    .to_str()
+                    .unwrap()
                     .to_owned();
                 let patterns = HashMap::from([
-                    ("left", left_rel),
-                    ("right", right_rel),
-                    ("width", "80".into()),
+                    ("left", OsString::from(left_rel)),
+                    ("right", OsString::from(right_rel)),
+                    ("width", OsString::from("80")),
                 ]);
 
                 let ui = Ui::null();
@@ -253,13 +256,10 @@ impl Mutation for GitFetch {
                     .unwrap_or_else(StringExpression::all),
                 ),
             };
-            let refspecs = git::expand_fetch_refspecs(
-                RemoteName::new(remote_name),
-                GitFetchRefExpression {
-                    bookmark: bookmark_expr,
-                    tag: tag_expr,
-                },
-            )?;
+            let expr = GitFetchRefExpression {
+                bookmark: bookmark_expr,
+                tag: tag_expr,
+            };
 
             let result = auth_ctx.with_callbacks(
                 Some(progress_sender.clone()),
@@ -272,7 +272,7 @@ impl Mutation for GitFetch {
                         git::GitFetch::new(tx.repo_mut(), subprocess_options, &import_options)?;
 
                     fetcher
-                        .fetch(RemoteName::new(remote_name), refspecs, cb, None)
+                        .fetch(RemoteName::new(remote_name), &expr, cb, None)
                         .context("failed to fetch")?;
 
                     pollster::block_on(fetcher.import_refs()).context("failed to import refs")?;
@@ -669,10 +669,8 @@ impl Mutation for ForgetWorkspace {
             tx.repo_mut().rebase_descendants().await?;
         }
 
-        ws.repo()
-            .loader()
-            .workspace_store()
-            .forget(&[&*workspace_name])?;
+        let workspace_store = tx.base_repo().loader().workspace_store();
+        workspace_store.forget(&[&*workspace_name])?;
 
         match ws
             .finish_transaction(

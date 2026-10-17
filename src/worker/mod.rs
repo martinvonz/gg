@@ -268,16 +268,13 @@ impl WorkerSession {
                 let mut tx = repo.start_transaction();
                 let mut fetcher =
                     GitFetch::new(tx.repo_mut(), subprocess_options, &import_options)?;
-                let refspecs = git::expand_fetch_refspecs(
-                    remote_name,
-                    GitFetchRefExpression {
-                        bookmark: StringExpression::all(),
-                        tag: tag_expr,
-                    },
-                )?;
+                let expr = GitFetchRefExpression {
+                    bookmark: StringExpression::all(),
+                    tag: tag_expr,
+                };
 
                 fetcher
-                    .fetch(remote_name, refspecs, cb, None)
+                    .fetch(remote_name, &expr, cb, None)
                     .context("Failed to fetch from remote")?;
 
                 pollster::block_on(fetcher.import_refs()).context("Failed to import refs")?;

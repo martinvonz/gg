@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use jj_cli::config::{ConfigEnv, config_from_environment, default_config_layers};
-use jj_cli::ui::Ui;
+use jj_cli::config::default_config_layers;
+use jj_frontend::config_env::{ConfigEnv, config_from_environment};
 use jj_lib::{
     config::{ConfigGetError, ConfigLayer, ConfigNamePathBuf, ConfigSource, StackedConfig},
     dsl_util::{AliasDeclarationParser, AliasesMap},
@@ -185,7 +185,7 @@ pub fn read_config(
     if let Some(repo_path) = repo_path {
         config_env.reset_repo_path(repo_path);
         config_env
-            .reload_repo_config(&Ui::null(), &mut raw_config)
+            .reload_repo_config(&mut vec![], &mut raw_config)
             .map_err(|e| anyhow!("{e:?}"))?;
     }
 
@@ -198,10 +198,8 @@ pub fn read_config(
         config.add_layer(overrides);
     }
 
-    let workspace_settings = UserSettings::from_config_and_home_dir(
-        config,
-        config_env.home_dir().map(ToOwned::to_owned),
-    )?;
+    let workspace_settings =
+        UserSettings::from_config_and_home_dir(config, config_env.home_dir().map(Path::to_owned))?;
 
     Ok((
         workspace_settings,

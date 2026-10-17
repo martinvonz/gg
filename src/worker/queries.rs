@@ -18,6 +18,7 @@ use jj_lib::{
     },
     diff_presentation::LineCompareMode,
     files::FileMergeHunkLevel,
+    files::MergeOptions,
     graph::{GraphEdgeType, GraphNode, TopoGroupedGraph},
     matchers::EverythingMatcher,
     merge::{Diff, SameChange},
@@ -27,7 +28,6 @@ use jj_lib::{
     repo_path::RepoPath,
     revset::{Revset, RevsetContainingFn, RevsetEvaluationError},
     rewrite,
-    tree_merge::MergeOptions,
 };
 use pollster::FutureExt as _;
 
@@ -371,7 +371,8 @@ pub async fn query_revisions(ws: &WorkspaceSession<'_>, set: RevSet) -> Result<R
     format_tree_changes(ws, &mut changes, tree_diff, conflict_labels).await?;
 
     let mut conflicts = Vec::new();
-    for (path, entry) in final_tree.entries() {
+    let mut entries = final_tree.entries_stream();
+    while let Some((path, entry)) = entries.next().await {
         if let Ok(entry) = entry
             && !entry.is_resolved()
         {

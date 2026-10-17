@@ -63,8 +63,9 @@ tauri-plugin-shell = "2.0.0"
 tauri-plugin-window-state = "2.0.0"
 tauri-plugin-log = "2.0.0"
 
-jj-lib = { version = "0.46.0", features = ["watchman"] }
-jj-cli = "0.46.0"
+jj-lib = { path = "../jj/lib", features = ["watchman"] }
+jj-cli = { path = "../jj/cli" }
+jj-frontend = { path = "../jj/frontend", features = ["git"] }
 
 # deps shared with JJ, which we try to keep on the same version
 clap = { version = "4.6.1", features = [
@@ -77,10 +78,11 @@ etcetera = "0.11.0"
 dunce = "1.0.5"
 itertools = "0.15"
 indexmap = "2.14"
-gix = { version = "0.88.0", default-features = false, features = [
+gix = { version = "0.89.0", default-features = false, features = [
     "index",
     "max-performance-safe",
     "blob-diff",
+    "sha1",
 ] }
 async-trait = "0.1.89"
 pollster = "1.0.1"
@@ -93,6 +95,7 @@ thiserror = "2.0.18"
 
 # deps used by JJ but with different features
 chrono = { version = "0.4.44", features = ["serde"] }
+jiff = "0.2"
 
 # extra deps not used by JJ
 anyhow = "1.0.100"

@@ -11,14 +11,12 @@ use std::{
 };
 
 use anyhow::{Context, Error, Result, anyhow};
-use chrono::TimeZone;
 use futures_util::TryStreamExt;
 use itertools::Itertools;
-use jj_cli::{
-    cli_util::{default_ignored_remote_name, short_operation_hash},
-    git_util::{is_colocated_git_workspace, load_git_import_options},
-    revset_util,
-    ui::Ui,
+use jj_cli::{cli_util::short_operation_hash, git_util::load_git_import_options, ui::Ui};
+use jj_frontend::{
+    git_util::is_colocated_git_workspace,
+    revset_util::{self, default_ignored_remote_name},
 };
 use jj_lib::{
     backend::{BackendError, ChangeId, CommitId},
@@ -156,8 +154,7 @@ impl WorkerSession {
             true
         };
 
-        let is_colocated =
-            is_colocated_git_workspace(&workspace).map_err(|e| Error::new(e.error))?;
+        let is_colocated = is_colocated_git_workspace(&workspace)?;
 
         Ok(WorkspaceSession {
             session: self,
@@ -257,10 +254,8 @@ impl WorkspaceSession<'_> {
         let mut tx = self.start_transaction().await?;
         tx.repo_mut().remove_workspace(&workspace_name).await?;
 
-        self.repo()
-            .loader()
-            .workspace_store()
-            .forget(&[&*workspace_name])?;
+        let workspace_store = tx.base_repo().loader().workspace_store();
+        workspace_store.forget(&[&*workspace_name])?;
 
         self.finish_transaction(
             tx,
@@ -279,7 +274,7 @@ impl WorkspaceSession<'_> {
         let mut tx = self.start_transaction().await?;
 
         // capture before locking the working copy
-        let workspace_store = self.repo().loader().workspace_store().clone();
+        let workspace_store = tx.base_repo().loader().workspace_store().clone();
         let is_colocated = self.is_colocated;
 
         let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
@@ -326,10 +321,11 @@ impl WorkspaceSession<'_> {
         }
 
         let repo_path = self.workspace.repo_path();
-        let workspace_store = self.repo().loader().workspace_store();
+        let workspace_store = self.operation.repo.loader().workspace_store();
 
         match workspace_store.get_workspace_path(&workspace_name)? {
-            Some(path) => absolute_workspace_path(&path),
+            // stored paths are relative to the repo directory
+            Some(stored_path) => absolute_workspace_path(&repo_path.join(stored_path)),
             // repos created before jj tracked workspace paths have no entries, but
             // the default workspace is the one hosting the repo, so we can find it
             None if *workspace_name == *WorkspaceName::DEFAULT => repo_path
@@ -1266,17 +1262,17 @@ impl WorkspaceData {
             workspace_name: name,
         };
         let now = if let Some(timestamp) = self.workspace_settings.commit_timestamp() {
-            chrono::Local
-                .timestamp_millis_opt(timestamp.timestamp.0)
+            jiff::Timestamp::from_millisecond(timestamp.timestamp.0)
                 .unwrap()
+                .to_zoned(jiff::tz::TimeZone::system())
         } else {
-            chrono::Local::now()
+            jiff::Zoned::now()
         };
         RevsetParseContext {
             aliases_map: &self.aliases_map,
             local_variables: HashMap::new(),
             user_email: self.workspace_settings.user_email(),
-            date_pattern_context: now.into(),
+            current_time: now,
             default_ignored_remote: default_ignored_remote_name(store),
             fileset_aliases_map: &self.fileset_aliases_map,
             extensions: &self.extensions,
@@ -1344,6 +1340,7 @@ impl OperationData {
     }
 
     pub fn base_ignores(&self, workspace_root: &Path) -> Result<Arc<GitIgnoreFile>> {
+        let home_dir = etcetera::home_dir().ok();
         fn xdg_config_home() -> Option<PathBuf> {
             if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
                 && !x.is_empty()
@@ -1353,12 +1350,11 @@ impl OperationData {
             etcetera::home_dir().ok().map(|home| home.join(".config"))
         }
 
-        let home_dir = etcetera::home_dir().ok();
         let get_excludes_file_path = |config: &gix::config::File| -> Option<PathBuf> {
             if let Some(value) = config.string("core.excludesFile") {
                 let path = std::str::from_utf8(&value)
                     .ok()
-                    .map(|value| file_util::expand_home_path(value, home_dir.as_deref()))?;
+                    .map(|path| file_util::expand_home_path(path, home_dir.as_deref()))?;
                 Some(workspace_root.join(path))
             } else {
                 xdg_config_home().map(|x| x.join("git").join("ignore"))

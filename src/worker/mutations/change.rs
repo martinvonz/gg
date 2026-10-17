@@ -740,7 +740,7 @@ async fn update_tree_entry(
     let mut builder = MergedTreeBuilder::new(original_tree.clone());
     builder.set_or_remove(
         path.to_owned(),
-        Merge::normal(TreeValue::File {
+        Some(TreeValue::File {
             id: new_blob,
             executable,
             copy_id: CopyId::placeholder(),
