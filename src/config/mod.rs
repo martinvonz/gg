@@ -15,9 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use jj_cli::config::default_config_layers;
 use jj_frontend::config_env::{ConfigEnv, config_from_environment};
-use jj_frontend::config_util::{self, ConfigWarning};
+use jj_frontend::config_util::{self, ConfigWarning, default_config_layers};
 use jj_lib::{
     config::{ConfigLayer, ConfigNamePathBuf, ConfigSource, StackedConfig},
     fileset::FilesetAliasesMap,
