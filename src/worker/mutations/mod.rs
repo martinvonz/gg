@@ -14,7 +14,11 @@ use jj_cli::{
     merge_tools::{self, ConflictResolveError, ExternalMergeTool, MergeEditor},
     ui::Ui,
 };
-use jj_frontend::{config_util, git_util::load_git_import_options};
+use jj_frontend::{
+    config_util,
+    git_util::load_git_import_options,
+    operation_util::{UndoError, ViewPortions, find_undo_target, restore_operation},
+};
 use jj_lib::{
     backend::{CommitId, TreeValue},
     conflicts::{self, ConflictMarkerStyle, ConflictMaterializeOptions, MaterializedTreeValue},
@@ -27,7 +31,6 @@ use jj_lib::{
     merge::{Diff, SameChange},
     merged_tree::MergedTree,
     object_id::ObjectId as ObjectIdTrait,
-    op_walk,
     ref_name::WorkspaceNameBuf,
     ref_name::{GitRefNameBuf, RefNameBuf, RemoteName, RemoteNameBuf, RemoteRefSymbol},
     refs::{self, LocalAndRemoteRef, RefPushAction},
@@ -593,7 +596,6 @@ impl Mutation for GitPush {
     }
 }
 
-// this is another case where it would be nice if we could reuse jj-cli's error messages
 #[async_trait(?Send)]
 impl Mutation for UndoOperation {
     async fn execute(
@@ -601,29 +603,27 @@ impl Mutation for UndoOperation {
         ws: &mut WorkspaceSession,
         _options: &MutationOptions,
     ) -> Result<MutationResult> {
-        let head_op = op_walk::resolve_op_with_repo(ws.repo(), "@").await?; // XXX this should be behind an abstraction, maybe reused in snapshot
-        let mut parent_ops = head_op.parents().await?.into_iter();
-
-        let Some(parent_op) = parent_ops.next() else {
-            precondition!("Cannot undo repo initialization");
-        };
-
-        if parent_ops.next().is_some() {
-            precondition!("Cannot undo a merge operation");
-        };
-
         let mut tx = ws.start_transaction().await?;
-        let repo_loader = tx.base_repo().loader();
-        let head_repo = repo_loader.load_at(&head_op).await?;
-        let parent_repo = repo_loader.load_at(&parent_op).await?;
-        tx.repo_mut().merge(&head_repo, &parent_repo).await?;
-        let restored_view = tx.repo().view().store_view().clone();
-        tx.repo_mut().set_view(restored_view);
+        let target = match find_undo_target(tx.base_repo(), ws.name(), false).await {
+            Ok(target) => target,
+            Err(UndoError::OtherWorkspace {
+                operation,
+                workspace_name,
+            }) => precondition!(
+                "Refusing to undo operation {} because it was performed in workspace {}",
+                &operation.hex()[..12],
+                workspace_name.as_symbol()
+            ),
+            Err(
+                err @ (UndoError::RootOperation
+                | UndoError::MergeOperation
+                | UndoError::NothingToRedo),
+            ) => precondition!("{err}"),
+            Err(err) => return Err(err.into()),
+        };
+        restore_operation(tx.repo_mut(), &target.restore_to, ViewPortions::ALL).await?;
 
-        match ws
-            .finish_transaction(tx, format!("undo operation {}", head_op.id().hex()))
-            .await?
-        {
+        match ws.finish_transaction(tx, target.description()).await? {
             Some(new_status) => {
                 let working_copy = ws.get_commit(ws.wc_id())?;
                 let new_selection = Some(ws.format_header(&working_copy, None)?);
@@ -970,6 +970,46 @@ auto-track = "glob:*.txt"
 
         // Verify: the .dat file should exist, but be untracked
         assert!(repo.path().join("untracked.dat").exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn undo_repeatedly_goes_further_back() -> Result<()> {
+        let repo = mkrepo();
+
+        let mut session = WorkerSession::default();
+        let mut ws = session.load_workspace(repo.path()).await?;
+        let initial_heads = ws.view().heads().clone();
+        let initial_description = ws.get_commit(ws.wc_id())?.description().to_owned();
+
+        DescribeRevision {
+            id: revs::working_copy(),
+            new_description: "first".to_owned(),
+            reset_author: false,
+        }
+        .execute_unboxed(&mut ws)
+        .await?;
+        DescribeRevision {
+            id: revs::resolve_conflict(),
+            new_description: "second".to_owned(),
+            reset_author: false,
+        }
+        .execute_unboxed(&mut ws)
+        .await?;
+
+        let result = UndoOperation.execute_unboxed(&mut ws).await?;
+        assert_matches!(result, MutationResult::Updated { .. });
+        assert_eq!(ws.get_commit(ws.wc_id())?.description(), "first");
+
+        // the second undo undoes the first description instead of the first undo
+        let result = UndoOperation.execute_unboxed(&mut ws).await?;
+        assert_matches!(result, MutationResult::Updated { .. });
+        assert_eq!(
+            ws.get_commit(ws.wc_id())?.description(),
+            initial_description
+        );
+        assert_eq!(*ws.view().heads(), initial_heads);
 
         Ok(())
     }
