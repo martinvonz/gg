@@ -19,7 +19,7 @@ use jj_frontend::{
         RunnerError, RunnerEvent, RunnerEvents, RunnerOptions, SnapshotConfig,
         SnapshotConfigDiagnostics, WorkspaceOperationRunner,
     },
-    workspace_env::{WorkspaceEnvironment, WorkspaceEnvironmentDiagnostics},
+    workspace_env::{WorkspaceEnvironment, WorkspaceEnvironmentDiagnostics, find_workspace_dir},
 };
 use jj_lib::{
     backend::{BackendError, ChangeId, CommitId},
@@ -1064,12 +1064,6 @@ impl OperationData {
     fn git_backend(&self) -> Option<&GitBackend> {
         self.repo.store().backend_impl::<GitBackend>()
     }
-}
-
-fn find_workspace_dir(cwd: &Path) -> &Path {
-    cwd.ancestors()
-        .find(|path| path.join(".jj").is_dir())
-        .unwrap_or(cwd)
 }
 
 fn absolute_workspace_path(path: &Path) -> Result<PathBuf> {
